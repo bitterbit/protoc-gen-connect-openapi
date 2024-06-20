@@ -26,6 +26,7 @@ import (
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/ghodss/yaml"
+	"github.com/samber/lo"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/pluginpb"
@@ -34,6 +35,11 @@ import (
 	"github.com/solo-io/protoc-gen-openapi/pkg/markers"
 	"github.com/solo-io/protoc-gen-openapi/pkg/protomodel"
 )
+
+type NamedPath struct {
+	Name     string
+	PathItem openapi3.PathItem
+}
 
 var descriptionExclusionMarkers = []string{"$hide_from_docs", "$hide", "@exclude"}
 
@@ -309,7 +315,7 @@ func (g *openapiGenerator) generateFile(name string,
 	pkg *protomodel.FileDescriptor,
 	messages map[string]*protomodel.MessageDescriptor,
 	enums map[string]*protomodel.EnumDescriptor,
-	_ map[string]*protomodel.ServiceDescriptor,
+	services map[string]*protomodel.ServiceDescriptor,
 ) pluginpb.CodeGeneratorResponse_File {
 	g.messages = messages
 
@@ -340,7 +346,7 @@ func (g *openapiGenerator) generateFile(name string,
 		} else if pd := g.generateDescription(g.currentPackage); pd != "" {
 			description = pd
 		} else {
-			description = "OpenAPI Spec for Solo APIs."
+			description = "OpenAPI Spec."
 		}
 		// derive the API version from the package name
 		// which is a convention for Istio APIs.
@@ -353,8 +359,56 @@ func (g *openapiGenerator) generateFile(name string,
 		s := strings.Split(p, ".")
 		version = s[len(s)-1]
 	} else {
-		description = "OpenAPI Spec for Solo APIs."
+		description = "OpenAPI Spec."
 	}
+
+	// fmt.Fprintln(os.Stderr, "schemas: ", lo.Keys(allSchemas))
+
+	namedPaths := lo.FlatMap(lo.Keys(services), func(serviceName string, _ int) []NamedPath {
+		service := services[serviceName]
+		return lo.Map(service.Methods, func(method *protomodel.MethodDescriptor, _ int) NamedPath {
+
+			postOperation := openapi3.NewOperation()
+			okResponse := openapi3.NewResponse().
+				WithDescription("OK")
+
+			if method.GetInputType() != "" {
+				inputType := strings.TrimPrefix(method.GetInputType(), ".")
+
+				if _, ok := allSchemas[inputType]; ok {
+					postOperation.RequestBody = &openapi3.RequestBodyRef{
+						Ref: "#/components/schemas/" + inputType,
+					}
+				} else {
+					fmt.Fprintln(os.Stderr, "missing schema for input type: ", inputType)
+				}
+			}
+
+			outputType := method.GetOutputType()
+			if outputType != "" {
+				outputType = strings.TrimPrefix(outputType, ".")
+				if _, ok := allSchemas[outputType]; ok {
+					ref := fmt.Sprintf("#/components/schemas/%s", outputType)
+					okResponse.WithContent(openapi3.NewContentWithJSONSchemaRef(openapi3.NewSchemaRef(ref, nil)))
+				} else {
+					fmt.Fprintln(os.Stderr, "missing schema for output type: ", outputType)
+				}
+			}
+
+			postOperation.AddResponse(200, okResponse)
+
+			return NamedPath{
+				Name: fmt.Sprintf("/%s/%s", serviceName, method.GetName()),
+				PathItem: openapi3.PathItem{
+					Post: postOperation,
+				},
+			}
+		})
+	})
+
+	paths := lo.SliceToMap(namedPaths, func(np NamedPath) (string, *openapi3.PathItem) {
+		return np.Name, &np.PathItem
+	})
 
 	c := openapi3.NewComponents()
 	c.Schemas = allSchemas
@@ -366,6 +420,7 @@ func (g *openapiGenerator) generateFile(name string,
 			Version: version,
 		},
 		Components: c,
+		Paths:      paths,
 	}
 
 	g.buffer.Reset()
